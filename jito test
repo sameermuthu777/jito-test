@@ -1,0 +1,235 @@
+// Jito Client - Dynamic Tips to Beat Competitors + Bundle Submission
+// Docs: https://jito-labs.gitbook.io/mev/searcher-resources/json-rpc-api-reference
+use anyhow::Result;
+use reqwest;
+use serde::{Deserialize, Serialize};
+use solana_sdk::{
+    signature::Signature,
+    transaction::Transaction,
+};
+use std::str::FromStr;
+use tracing::{info, warn};
+
+// Jito Block Engine endpoints (mainnet) - from official docs
+const JITO_MAINNET_URL: &str = "https://mainnet.block-engine.jito.wtf";
+const JITO_NY_URL: &str = "https://ny.mainnet.block-engine.jito.wtf";
+const JITO_AMSTERDAM_URL: &str = "https://amsterdam.mainnet.block-engine.jito.wtf";
+const JITO_TOKYO_URL: &str = "https://tokyo.mainnet.block-engine.jito.wtf";
+const JITO_FRANKFURT_URL: &str = "https://frankfurt.mainnet.block-engine.jito.wtf";
+const JITO_LONDON_URL: &str = "https://london.mainnet.block-engine.jito.wtf";
+const JITO_SINGAPORE_URL: &str = "https://singapore.mainnet.block-engine.jito.wtf";
+
+// Jito tip payment addresses (rotate for best performance)
+const JITO_TIP_ACCOUNTS: &[&str] = &[
+    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+    "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+];
+
+#[derive(Serialize)]
+struct JsonRpcRequest {
+    jsonrpc: String,
+    id: u64,
+    method: String,
+    params: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcResponse {
+    jsonrpc: String,
+    id: u64,
+    result: Option<serde_json::Value>,
+    error: Option<JsonRpcError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcError {
+    code: i64,
+    message: String,
+}
+
+/// Calculate optimal tip to beat competitors
+/// Tips 35% of expected profit to validator
+pub fn calculate_optimal_tip(expected_profit_usd: f64, sol_price_usd: f64) -> u64 {
+    if expected_profit_usd <= 0.0 {
+        return 10_000; // Minimum tip for testing
+    }
+    
+    let tip_percentage = 0.35; // Give 35% to validator
+    let tip_usd = expected_profit_usd * tip_percentage;
+    let tip_sol = tip_usd / sol_price_usd;
+    let tip_lamports = (tip_sol * 1e9) as u64;
+    
+    // Clamp to reasonable range
+    tip_lamports.clamp(10_000, 10_000_000) // Min 0.00001 SOL, Max 0.01 SOL
+}
+
+/// Submit bundle to Jito block engine
+pub async fn submit_bundle(
+    transactions: Vec<Transaction>,
+) -> Result<String> {
+    info!("📦 Submitting bundle to Jito with {} transactions", transactions.len());
+    
+    // Serialize transactions to base58
+    let serialized_txs: Vec<String> = transactions
+        .iter()
+        .map(|tx| {
+            let serialized = bincode::serialize(tx).expect("Failed to serialize transaction");
+            bs58::encode(serialized).into_string()
+        })
+        .collect();
+    
+    // Try multiple endpoints for best performance
+    let endpoints = vec![
+        JITO_MAINNET_URL,
+        JITO_FRANKFURT_URL,    // Try Europe first (less traffic)
+        JITO_LONDON_URL,
+        JITO_SINGAPORE_URL,    // Asia
+        JITO_TOKYO_URL,
+        JITO_AMSTERDAM_URL,
+        JITO_NY_URL,           // US last (most traffic)
+    ];
+    
+    for (i, endpoint) in endpoints.iter().enumerate() {
+        info!("   Trying endpoint {}/{}: {}", i + 1, endpoints.len(), endpoint);
+        
+        // Add delay between endpoints to avoid rate limiting
+        // Jito free tier: 1 request per second per IP per region
+        if i > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+            info!("   ⏳ Waiting 2s to respect rate limits...");
+        }
+        
+        match submit_to_endpoint(endpoint, &serialized_txs).await {
+            Ok(bundle_id) => {
+                info!("✅ Bundle submitted successfully! ID: {}", bundle_id);
+                return Ok(bundle_id);
+            }
+            Err(e) => {
+                warn!("   Failed: {} (trying next endpoint...)", e);
+                continue;
+            }
+        }
+    }
+    
+    anyhow::bail!("All Jito endpoints failed!")
+}
+
+async fn submit_to_endpoint(endpoint: &str, transactions: &[String]) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    
+    // Match reference bot format exactly
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: 1,
+        method: "sendBundle".to_string(),
+        params: vec![
+            serde_json::json!(transactions),
+            serde_json::json!({"encoding": "base64"})  // Required by Jito!
+        ],
+    };
+    
+    // Check for Jito UUID (free authentication for higher rate limits)
+    let jito_uuid = std::env::var("JITO_UUID").ok();
+    let jito_auth = std::env::var("JITO_AUTH_TOKEN").ok();
+    
+    let url = if let Some(uuid) = jito_uuid {
+        format!("{}/api/v1/bundles?uuid={}", endpoint, uuid)
+    } else {
+        format!("{}/api/v1/bundles", endpoint)
+    };
+    
+    let mut request_builder = client.post(&url).json(&request);
+    
+    // Add auth header if available
+    if let Some(auth) = jito_auth {
+        request_builder = request_builder.header("x-jito-auth", auth);
+    }
+    
+    let response = request_builder.send().await?;
+    
+    if !response.status().is_success() {
+        anyhow::bail!("HTTP error: {}", response.status());
+    }
+    
+    let json_response: JsonRpcResponse = response.json().await?;
+    
+    if let Some(error) = json_response.error {
+        anyhow::bail!("Jito error: {} (code: {})", error.message, error.code);
+    }
+    
+    if let Some(result) = json_response.result {
+        if let Some(bundle_id) = result.as_str() {
+            return Ok(bundle_id.to_string());
+        }
+    }
+    
+    anyhow::bail!("Unexpected response format")
+}
+
+/// Get Jito tip account (rotate for load balancing)
+pub fn get_tip_account(index: usize) -> Result<solana_sdk::pubkey::Pubkey> {
+    let account_str = JITO_TIP_ACCOUNTS[index % JITO_TIP_ACCOUNTS.len()];
+    solana_sdk::pubkey::Pubkey::from_str(account_str)
+        .map_err(|e| anyhow::anyhow!("Failed to parse tip account: {}", e))
+}
+
+/// Build a tip transfer instruction (SOL transfer to Jito validator)
+pub fn build_tip_instruction(
+    from_pubkey: &solana_sdk::pubkey::Pubkey,
+    tip_lamports: u64,
+    tip_account_index: usize,
+) -> Result<solana_sdk::instruction::Instruction> {
+    let tip_account = get_tip_account(tip_account_index)?;
+    
+    info!("💰 Building Jito tip transfer...");
+    info!("   From: {}", from_pubkey);
+    info!("   To: {}", tip_account);
+    info!("   Amount: {} lamports ({:.6} SOL)", tip_lamports, tip_lamports as f64 / 1e9);
+    
+    // Create SOL transfer instruction
+    let instruction = solana_sdk::system_instruction::transfer(
+        from_pubkey,
+        &tip_account,
+        tip_lamports,
+    );
+    
+    info!("✅ Tip instruction built");
+    
+    Ok(instruction)
+}
+
+/// Calculate tip based on expected profit and current SOL price
+pub fn calculate_tip_from_profit(
+    expected_profit_usdc: f64,
+    sol_price_usd: f64,
+) -> u64 {
+    if expected_profit_usdc <= 0.0 {
+        return 10_000; // Minimum tip: 0.00001 SOL (~$0.0016 at $160/SOL)
+    }
+    
+    // Give 35% of profit to validator as tip
+    let tip_percentage = 0.35;
+    let tip_usd = expected_profit_usdc * tip_percentage;
+    let tip_sol = tip_usd / sol_price_usd;
+    let tip_lamports = (tip_sol * 1e9) as u64;
+    
+    // Clamp to reasonable range
+    // Min: 0.00001 SOL, Max: 0.01 SOL
+    let clamped_tip = tip_lamports.clamp(10_000, 10_000_000);
+    
+    info!("💡 Tip calculation:");
+    info!("   Expected profit: ${:.2}", expected_profit_usdc);
+    info!("   SOL price: ${:.2}", sol_price_usd);
+    info!("   Tip (35% of profit): ${:.4} = {:.6} SOL", tip_usd, clamped_tip as f64 / 1e9);
+    
+    clamped_tip
+}
+
